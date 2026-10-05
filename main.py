@@ -37,7 +37,7 @@ async def handle_usr_client(reader, writer):
     global usr_reader, usr_writer
     # Extrai o endereço IP e porta de origem do equipamento cliente conectado
     addr = writer.get_extra_info('peername')
-    # Registra no log que o equipamento USR-TCP232 estabeleceu a conexão TCP na porta 9001
+    # Registra no log que o equipamento USR-TCP232 established a conexão TCP na porta 9001
     logger.info(f"Conexão TCP estabelecida do USR-TCP232 (9001): {addr}")
     # Atribui o fluxo de leitura do socket à variável global
     usr_reader = reader
@@ -92,18 +92,32 @@ async def handle_notebook_client(reader, writer):
             # Registra no log o pacote hexadecimal enviado pelo Notebook
             logger.debug(f"[NOTEBOOK -> USR] {data.hex()}")
             
-            # Adquire a trava mutex para garatir acesso exclusivo à conexão com o USR
+            # Adquire a trava mutex para garantir acesso exclusivo à conexão com o USR
             async with modbus_lock:
                 # Verifica se a conexão com o hardware USR-TCP232 está ativa
                 if usr_writer and usr_reader:
-                    # Envia a sequência de bytes diretamente para o socket do USR-TCP232
+                    # PURGA DE BUFFER: Descarta pacotes antigos retidos no socket antes de novo envio
+                    try:
+                        while True:
+                            # Tenta ler dados residuais no buffer com tempo limite de 10ms
+                            stale_data = await asyncio.wait_for(usr_reader.read(1024), timeout=0.01)
+                            if stale_data:
+                                # Registra no log o descarte de dados residuais
+                                logger.debug(f"[PURGA BUFFER USR] Descartado: {stale_data.hex()}")
+                            else:
+                                break
+                    # Quando o buffer do socket está totalmente limpo, estoura o timeout de 10ms
+                    except asyncio.TimeoutError:
+                        pass
+
+                    # Envia a nova sequência de bytes diretamente para o socket do USR-TCP232
                     usr_writer.write(data)
                     # Força o esvaziamento da fila do socket enviando todos os dados pela rede
                     await usr_writer.drain()
                     
                     # Bloco de aguardo da resposta com limite de tempo (timeout)
                     try:
-                        # Aguarda o retorno de até 4096 bytes do USR com tempo limite de 5 segundos
+                        # Aguarda o retorno da resposta correspondente com timeout de 5 segundos
                         response = await asyncio.wait_for(usr_reader.read(4096), timeout=5.0)
                         # Registra no log a resposta hexadecimal devolvida pelo FieldLogger
                         logger.debug(f"[USR -> NOTEBOOK] {response.hex()}")
@@ -215,7 +229,7 @@ async def read_holding_registers(
             else:
                 # Apenas desloca os bits uma posição para a direita
                 crc >>= 1
-    # Adiciona o byte LSB do CRC calculated ao final da mensagem Modbus
+    # Adiciona o byte LSB do CRC calculado ao final da mensagem Modbus
     raw_payload.append(crc & 0xFF)
     # Adiciona o byte MSB do CRC calculated ao final da mensagem Modbus
     raw_payload.append((crc >> 8) & 0xFF)
