@@ -1,95 +1,139 @@
-import socket
+# Importa o módulo de E/S assíncrona nativo do Python (gerencia tarefas concorrentes sem threads)
+import asyncio
+# Importa o módulo padrão para geração de logs e mensagens de depuração
+import logging
+# Importa o módulo select para monitoramento de estados de conectividade e I/O de sockets
 import select
+# Importa o módulo time para medição e controle de timestamps
 import time
+# Importa o utilitário para gerenciamento do ciclo de vida da aplicação FastAPI
+from contextlib import asynccontextmanager
+# Importa os componentes do framework FastAPI para construção dos endpoints HTTP e respostas de erro
+from fastapi import FastAPI, HTTPException, Query
 
-# Configurações do USR-TCP232
-USR_IP = "192.168.1.200"   # Altere para o IP real do seu USR na rede local
-USR_PORT = 9001           # Porta atual do USR (não precisa alterar no local)
+# Configura o formato e o nível global de registo de logs da aplicação (nível DEBUG exibe tudo)
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+# Cria uma instância dedicada do registador de log com o identificador 'modbus_broker'
+logger = logging.getLogger("modbus_broker")
 
-# Portas dos Clientes no Broker Docker
-PORT_NOTEBOOK = 9002      # Porta Exclusiva/Prioritária (FieldLogger Config)
-PORT_N8N = 5000           # Porta de Rotina (n8n)
+# Instancia uma trava de exclusão mútua assíncrona (Mutex) para evitar acessos simultâneos ao USR
+modbus_lock = asyncio.Lock()
+# Inicializa a variável que guarda o último timestamp em que o Notebook enviou dados
+last_notebook_activity = 0
+# Define a janela de tempo (em segundos) que o Notebook terá prioridade absoluta na linha serial
+NOTEBOOK_PRIORITY_TIMEOUT = 5.0
 
-FL_TIMEOUT_PRIORITY = 3.0  # Tempo em segundos de prioridade após a última transmissão do Notebook
+# Declara a variável global para armazenar o objeto leitor da conexão com o USR-TCP232
+usr_reader = None
+# Declara a variável global para armazenar o objeto escritor da conexão com o USR-TCP232
+usr_writer = None
 
-def main():
-    # Socket para comunicar com o USR-TCP232
-    usr_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    usr_sock.connect((USR_IP, USR_PORT))
-    usr_sock.setblocking(False)
+# Define a função de callback assíncrona que lida com o cliente USR-TCP232 (porta 9001)
+async def handle_usr_client(reader, writer):
+    # Indica o uso das variáveis globais para manter o socket ativo durante o ciclo da aplicação
+    global usr_reader, usr_writer
+    # Extrai o endereço IP e porta de origem do equipamento cliente conectado
+    addr = writer.get_extra_info('peername')
+    # Registra no log que o equipamento USR-TCP232 estabeleceu a conexão TCP na porta 9001
+    logger.info(f"Conexão TCP estabelecida do USR-TCP232 (9001): {addr}")
+    # Atribui o fluxo de leitura do socket à variável global
+    usr_reader = reader
+    # Atribui o fluxo de escrita do socket à variável global
+    usr_writer = writer
+    
+    # Bloco para manter a conexão aberta indefinidamente
+    try:
+        # Loop infinito para manter a corrotina viva enquanto a conexão persistir
+        while True:
+            # Pausa a execução da corrotina por 1 hora sem bloquear a thread principal
+            await asyncio.sleep(3600)
+    # Captura eventuais exceções de rede ou desconexão do hardware
+    except Exception as e:
+        # Registra a mensagem de erro no log caso a conexão caia
+        logger.error(f"Exceção na conexão USR (9001): {e}")
+    # Bloco executado sempre que a conexão for encerrada
+    finally:
+        # Registra no log o encerramento da conexão TCP do USR
+        logger.info(f"Conexão TCP encerrada do USR-TCP232: {addr}")
+        # Limpa a variável global do leitor
+        usr_reader = None
+        # Limpa a variável global do escritor
+        usr_writer = None
+        # Solicita o fechamento do socket do cliente
+        writer.close()
+        # Aguarda a confirmação de encerramento do socket pelo sistema operacional
+        await writer.wait_closed()
 
-    # Socket Servidor para o Notebook (Porta 9002)
-    server_fl = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_fl.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_fl.bind(('0.0.0.0', PORT_NOTEBOOK))
-    server_fl.listen(5)
-
-    # Socket Servidor para o n8n (Porta 5000)
-    server_n8n = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_n8n.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_n8n.bind(('0.0.0.0', PORT_N8N))
-    server_n8n.listen(5)
-
-    clients_fl = []
-    clients_n8n = []
-
-    last_fl_activity = 0
-
-    print(f"Broker rodando: Notebook [Porta {PORT_NOTEBOOK}] | n8n [Porta {PORT_N8N}] -> USR-TCP232 [{USR_IP}:{USR_PORT}]")
-
-    while True:
-        readable = [server_fl, server_n8n, usr_sock] + clients_fl + clients_n8n
-        r_list, _, _ = select.select(readable, [], [], 0.1)
-
-        now = time.time()
-        in_priority_mode = (now - last_fl_activity) < FL_TIMEOUT_PRIORITY
-
-        for s in r_list:
-            # 1. Nova conexão do Notebook
-            if s == server_fl:
-                conn, addr = server_fl.accept()
-                clients_fl.append(conn)
-                print(f"[NOTEBOOK] Conectado de {addr}")
-
-            # 2. Nova conexão do n8n
-            elif s == server_n8n:
-                conn, addr = server_n8n.accept()
-                clients_n8n.append(conn)
-                print(f"[N8N] Conectado de {addr}")
-
-            # 3. Pacotes vindos do Notebook (PRIORIDADE)
-            elif s in clients_fl:
-                data = s.recv(1024)
-                if data:
-                    last_fl_activity = time.time()  # Atualiza a trava de prioridade
-                    usr_sock.sendall(data)          # Encaminha direto para o USR
+# Define a função de callback assíncrona que lida com o software do Notebook (porta 9002)
+async def handle_notebook_client(reader, writer):
+    # Indica o uso da variável global que controla o tempo de atividade do Notebook
+    global last_notebook_activity
+    # Obtém as informações do IP e porta do Notebook conectado
+    addr = writer.get_extra_info('peername')
+    # Registra no log que o Notebook estabeleceu conexão na porta 9002
+    logger.info(f"Conexão TCP estabelecida do Notebook (9002): {addr}")
+    
+    # Bloco para processamento das requisições de coleta do FieldLogger Config
+    try:
+        # Loop continuo de escuta enquanto o Notebook transmitir dados
+        while True:
+            # Lê até 4096 bytes recebidos do socket do Notebook
+            data = await reader.read(4096)
+            # Se não houver dados retornados (0 bytes), o cliente fechou o socket
+            if not data:
+                # Interrompe o loop de leitura
+                break
+            
+            # Atualiza o timestamp atual marcando atividade ativa no Notebook
+            last_notebook_activity = time.time()
+            # Registra no log o pacote hexadecimal enviado pelo Notebook
+            logger.debug(f"[NOTEBOOK -> USR] {data.hex()}")
+            
+            # Adquire a trava mutex para garatir acesso exclusivo à conexão com o USR
+            async with modbus_lock:
+                # Verifica se a conexão com o hardware USR-TCP232 está ativa
+                if usr_writer and usr_reader:
+                    # Envia a sequência de bytes diretamente para o socket do USR-TCP232
+                    usr_writer.write(data)
+                    # Força o esvaziamento da fila do socket enviando todos os dados pela rede
+                    await usr_writer.drain()
+                    
+                    # Bloco de aguardo da resposta com limite de tempo (timeout)
+                    try:
+                        # Aguarda o retorno de até 4096 bytes do USR com tempo limite de 5 segundos
+                        response = await asyncio.wait_for(usr_reader.read(4096), timeout=5.0)
+                        # Registra no log a resposta hexadecimal devolvida pelo FieldLogger
+                        logger.debug(f"[USR -> NOTEBOOK] {response.hex()}")
+                        # Escreve a resposta de volta no socket do Notebook
+                        writer.write(response)
+                        # Garante o envio imediato dos bytes de resposta para o Notebook
+                        await writer.drain()
+                    # Trata o estouro do tempo limite de resposta do hardware
+                    except asyncio.TimeoutError:
+                        # Registra um aviso no log informando o estouro de tempo limite
+                        logger.warning("Timeout aguardando resposta do FieldLogger para a porta 9002.")
+                # Se o USR não estiver conectado no broker
                 else:
-                    clients_fl.remove(s)
-                    s.close()
+                    # Registra aviso informando ausência de conexão na porta 9001
+                    logger.warning("Notebook enviou dados, mas o USR-TCP232 não está conectado na 9001.")
+    # Trata exceções não previstas durante o túnel TCP
+    except Exception as e:
+        # Exibe o erro ocorrido na porta 9002
+        logger.error(f"Erro no manuseio da porta 9002 (Notebook): {e}")
+    # Bloco executado ao término da comunicação ou desconexão
+    finally:
+        # Registra a desconexão da porta 9002 no log
+        logger.info(f"Conexão TCP encerrada do Notebook (9002): {addr}")
+        # Solicita o encerramento do socket com o Notebook
+        writer.close()
+        # Aguarda a liberação dos recursos do socket pelo sistema
+        await writer.wait_closed()
 
-            # 4. Pacotes vindos do n8n (BAIXA PRIORIDADE)
-            elif s in clients_n8n:
-                data = s.recv(1024)
-                if data:
-                    if in_priority_mode:
-                        # Se o Notebook estiver baixando dados, descarta o envio do n8n
-                        print("[BLOQUEIO] Requisição do n8n ignorada (Coleta do Notebook ativa)")
-                    else:
-                        usr_sock.sendall(data)
-                else:
-                    clients_n8n.remove(s)
-                    s.close()
-
-            # 5. Resposta vinda do FieldLogger (via USR-TCP232)
-            elif s == usr_sock:
-                data = usr_sock.recv(1024)
-                if data:
-                    if in_priority_mode and clients_fl:
-                        for client in clients_fl:
-                            client.sendall(data)
-                    elif clients_n8n:
-                        for client in clients_n8n:
-                            client.sendall(data)
-
-if __name__ == "__main__":
-    main()
+# Define o gerenciador de contexto assíncrono para startup e shutdown da aplicação
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Inicia o servidor TCP escutando na porta 9001 para receber o USR-TCP232
+    server_9001 = await asyncio.start_server(handle_usr_client, '0.0
