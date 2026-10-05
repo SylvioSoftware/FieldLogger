@@ -110,13 +110,13 @@ async def handle_notebook_client(reader, writer):
                     except asyncio.TimeoutError:
                         pass
 
-                    # Envia a nova sequência de bytes diretamente para o socket do USR-TCP232
-                    usr_writer.write(data)
-                    # Força o esvaziamento da fila do socket enviando todos os dados pela rede
-                    await usr_writer.drain()
-                    
-                    # Bloco de aguardo da resposta com limite de tempo (timeout)
+                    # Bloco protegido de transmissão para o USR tratando queda de rede física
                     try:
+                        # Envia a nova sequência de bytes diretamente para o socket do USR-TCP232
+                        usr_writer.write(data)
+                        # Força o esvaziamento da fila do socket enviando todos os dados pela rede
+                        await usr_writer.drain()
+                        
                         # Aguarda o retorno da resposta correspondente com timeout de 5 segundos
                         response = await asyncio.wait_for(usr_reader.read(4096), timeout=5.0)
                         # Registra no log a resposta hexadecimal devolvida pelo FieldLogger
@@ -129,11 +129,15 @@ async def handle_notebook_client(reader, writer):
                     except asyncio.TimeoutError:
                         # Registra um aviso no log informando o estouro de tempo limite
                         logger.warning("Timeout aguardando resposta do FieldLogger para a porta 9002.")
+                    # Captura queda abrupta de conexão TCP do lado do USR sem derrubar a porta 9002
+                    except (ConnectionResetError, BrokenPipeError, OSError) as net_err:
+                        # Registra no log a desconexão física do USR
+                        logger.error(f"USR-TCP232 desconectou durante a transmissão: {net_err}")
                 # Se o USR não estiver conectado no broker
                 else:
                     # Registra aviso informando ausência de conexão na porta 9001
                     logger.warning("Notebook enviou dados, mas o USR-TCP232 não está conectado na 9001.")
-    # Trata exceções não previstas durante o túnel TCP
+    # Trata exceções não previstas no ciclo do socket do Notebook
     except Exception as e:
         # Exibe o erro ocorrido na porta 9002
         logger.error(f"Erro no manuseio da porta 9002 (Notebook): {e}")
