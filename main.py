@@ -136,4 +136,11 @@ async def handle_notebook_client(reader, writer):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Inicia o servidor TCP escutando na porta 9001 para receber o USR-TCP232
-    server_9001 = await asyncio.start_server(handle_usr_client, '0.0
+    server_9001 = await asyncio.start_server(handle_usr_client, '0.0.0.0', 9001)
+    # Inicia o servidor TCP escutando na porta 9002 para receber o FieldLogger Config
+    server_9002 = await asyncio.start_server(handle_notebook_client, '0.0.0.0', 9002)
+    
+    # Registra no log que ambos os servidores TCP foram inicializados com sucesso
+    logger.info("Servidores TCP iniciados nas portas 9001 (USR) e 9002 (Notebook).")
+    # Cede o controle para o FastAPI executar o servidor Web/HTTP
+    yield
