@@ -1,148 +1,95 @@
-import asyncio
-import logging
-from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Query
+import socket
+import select
+import time
 
-# LOG VERBOSO ATIVADO: Mostra todas as trocas de bytes e chamadas internas
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-)
-logger = logging.getLogger("modbus_broker")
+# Configurações do USR-TCP232
+USR_IP = "192.168.1.200"   # Altere para o IP real do seu USR na rede local
+USR_PORT = 9001           # Porta atual do USR (não precisa alterar no local)
 
-# Trava global de concorrência para evitar colisão entre a porta 9002 (Notebook) e 5000 (n8n)
-modbus_lock = asyncio.Lock()
+# Portas dos Clientes no Broker Docker
+PORT_NOTEBOOK = 9002      # Porta Exclusiva/Prioritária (FieldLogger Config)
+PORT_N8N = 5000           # Porta de Rotina (n8n)
 
-usr_reader = None
-usr_writer = None
+FL_TIMEOUT_PRIORITY = 3.0  # Tempo em segundos de prioridade após a última transmissão do Notebook
 
-async def handle_usr_client(reader, writer):
-    global usr_reader, usr_writer
-    addr = writer.get_extra_info('peername')
-    logger.info(f"Conexão TCP estabelecida do USR-TCP232 (9001): {addr}")
-    usr_reader = reader
-    usr_writer = writer
-    
-    try:
-        while True:
-            await asyncio.sleep(3600)
-    except Exception as e:
-        logger.error(f"Exceção na conexão USR (9001): {e}", exc_info=True)
-    finally:
-        logger.info(f"Conexão TCP encerrada do USR-TCP232: {addr}")
-        usr_reader = None
-        usr_writer = None
-        writer.close()
-        await writer.wait_closed()
+def main():
+    # Socket para comunicar com o USR-TCP232
+    usr_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    usr_sock.connect((USR_IP, USR_PORT))
+    usr_sock.setblocking(False)
 
-async def handle_notebook_client(reader, writer):
-    addr = writer.get_extra_info('peername')
-    logger.info(f"Conexão TCP estabelecida do Notebook (9002): {addr}")
-    
-    try:
-        while True:
-            data = await reader.read(1024)
-            if not data:
-                logger.debug("Notebook desconectou a transmissão (0 bytes lidos).")
-                break
-            
-            logger.debug(f"[9002 -> USR] Bytes recebidos do Notebook: {data.hex()}")
-            
-            async with modbus_lock:
-                if usr_writer and usr_reader:
-                    usr_writer.write(data)
-                    await usr_writer.drain()
-                    logger.debug("[9002 -> USR] Dados enviados ao USR-TCP232. Aguardando resposta...")
-                    
-                    try:
-                        response = await asyncio.wait_for(usr_reader.read(4096), timeout=5.0)
-                        logger.debug(f"[USR -> 9002] Resposta recebida do FieldLogger: {response.hex()}")
-                        
-                        writer.write(response)
-                        await writer.drain()
-                        logger.debug("[USR -> 9002] Resposta entregue ao Notebook.")
-                    except asyncio.TimeoutError:
-                        logger.warning("Timeout aguardando resposta do FieldLogger na porta 9001.")
+    # Socket Servidor para o Notebook (Porta 9002)
+    server_fl = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_fl.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_fl.bind(('0.0.0.0', PORT_NOTEBOOK))
+    server_fl.listen(5)
+
+    # Socket Servidor para o n8n (Porta 5000)
+    server_n8n = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_n8n.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_n8n.bind(('0.0.0.0', PORT_N8N))
+    server_n8n.listen(5)
+
+    clients_fl = []
+    clients_n8n = []
+
+    last_fl_activity = 0
+
+    print(f"Broker rodando: Notebook [Porta {PORT_NOTEBOOK}] | n8n [Porta {PORT_N8N}] -> USR-TCP232 [{USR_IP}:{USR_PORT}]")
+
+    while True:
+        readable = [server_fl, server_n8n, usr_sock] + clients_fl + clients_n8n
+        r_list, _, _ = select.select(readable, [], [], 0.1)
+
+        now = time.time()
+        in_priority_mode = (now - last_fl_activity) < FL_TIMEOUT_PRIORITY
+
+        for s in r_list:
+            # 1. Nova conexão do Notebook
+            if s == server_fl:
+                conn, addr = server_fl.accept()
+                clients_fl.append(conn)
+                print(f"[NOTEBOOK] Conectado de {addr}")
+
+            # 2. Nova conexão do n8n
+            elif s == server_n8n:
+                conn, addr = server_n8n.accept()
+                clients_n8n.append(conn)
+                print(f"[N8N] Conectado de {addr}")
+
+            # 3. Pacotes vindos do Notebook (PRIORIDADE)
+            elif s in clients_fl:
+                data = s.recv(1024)
+                if data:
+                    last_fl_activity = time.time()  # Atualiza a trava de prioridade
+                    usr_sock.sendall(data)          # Encaminha direto para o USR
                 else:
-                    logger.warning("Solicitação na porta 9002 rejeitada: USR-TCP232 (9001) não está conectado.")
-    except Exception as e:
-        logger.error(f"Erro no manuseio da porta 9002: {e}", exc_info=True)
-    finally:
-        logger.info(f"Conexão TCP encerrada do Notebook (9002): {addr}")
-        writer.close()
-        await writer.wait_closed()
+                    clients_fl.remove(s)
+                    s.close()
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    logger.info("Iniciando servidores TCP nas portas 9001 e 9002...")
-    server_9001 = await asyncio.start_server(handle_usr_client, '0.0.0.0', 9001)
-    server_9002 = await asyncio.start_server(handle_notebook_client, '0.0.0.0', 9002)
-    
-    logger.info("Servidores TCP ativos e prontos nas portas 9001 e 9002.")
-    yield
-    server_9001.close()
-    server_9002.close()
-    await server_9001.wait_closed()
-    await server_9002.wait_closed()
+            # 4. Pacotes vindos do n8n (BAIXA PRIORIDADE)
+            elif s in clients_n8n:
+                data = s.recv(1024)
+                if data:
+                    if in_priority_mode:
+                        # Se o Notebook estiver baixando dados, descarta o envio do n8n
+                        print("[BLOQUEIO] Requisição do n8n ignorada (Coleta do Notebook ativa)")
+                    else:
+                        usr_sock.sendall(data)
+                else:
+                    clients_n8n.remove(s)
+                    s.close()
 
-# Instância pública do FastAPI exigida pelo Uvicorn/ASGI
-app = FastAPI(title="Modbus Broker & Gateway", lifespan=lifespan)
+            # 5. Resposta vinda do FieldLogger (via USR-TCP232)
+            elif s == usr_sock:
+                data = usr_sock.recv(1024)
+                if data:
+                    if in_priority_mode and clients_fl:
+                        for client in clients_fl:
+                            client.sendall(data)
+                    elif clients_n8n:
+                        for client in clients_n8n:
+                            client.sendall(data)
 
-@app.get("/health")
-async def health():
-    return {
-        "status": "online",
-        "usr_connected": usr_writer is not None
-    }
-
-@app.get("/read_holding_registers")
-async def read_holding_registers(
-    unit: int = Query(1, description="ID Modbus do escravo"),
-    address: int = Query(0, description="Endereço inicial dos registadores"),
-    count: int = Query(10, description="Quantidade de registadores a ler")
-):
-    if not usr_writer or not usr_reader:
-        raise HTTPException(status_code=503, detail="USR-TCP232 / FieldLogger não conectado na porta 9001")
-
-    raw_payload = bytearray([
-        unit,
-        0x03,
-        (address >> 8) & 0xFF,
-        address & 0xFF,
-        (count >> 8) & 0xFF,
-        count & 0xFF
-    ])
-
-    crc = 0xFFFF
-    for pos in raw_payload:
-        crc ^= pos
-        for _ in range(8):
-            if (crc & 0x0001) != 0:
-                crc >>= 1
-                crc ^= 0xA001
-            else:
-                crc >>= 1
-    raw_payload.append(crc & 0xFF)
-    raw_payload.append((crc >> 8) & 0xFF)
-
-    logger.debug(f"[n8n -> USR] Payload Modbus RTU enviado: {raw_payload.hex()}")
-
-    async with modbus_lock:
-        try:
-            usr_writer.write(raw_payload)
-            await usr_writer.drain()
-
-            response = await asyncio.wait_for(usr_reader.read(1024), timeout=3.0)
-            logger.debug(f"[USR -> n8n] Resposta Modbus RTU recebida: {response.hex()}")
-            
-            return {
-                "status": "success",
-                "bytes_hex": response.hex(),
-                "raw_bytes": list(response)
-            }
-        except asyncio.TimeoutError:
-            logger.error("Timeout aguardando resposta do FieldLogger para a chamada do n8n.")
-            raise HTTPException(status_code=504, detail="Timeout de resposta do FieldLogger")
-        except Exception as e:
-            logger.error(f"Erro ao processar chamada HTTP do n8n: {e}", exc_info=True)
-            raise HTTPException(status_code=500, detail=str(e))
+if __name__ == "__main__":
+    main()
