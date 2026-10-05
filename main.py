@@ -144,3 +144,104 @@ async def lifespan(app: FastAPI):
     logger.info("Servidores TCP iniciados nas portas 9001 (USR) e 9002 (Notebook).")
     # Cede o controle para o FastAPI executar o servidor Web/HTTP
     yield
+    # Encerra a escuta de novas conexões na porta 9001 ao fechar a aplicação
+    server_9001.close()
+    # Encerra a escuta de novas conexões na porta 9002 ao fechar a aplicação
+    server_9002.close()
+    # Aguarda o término da limpeza dos sockets da porta 9001
+    await server_9001.wait_closed()
+    # Aguarda o término da limpeza dos sockets da porta 9002
+    await server_9002.wait_closed()
+
+# Instancia a aplicação FastAPI (a variável 'app' é exigida pelo Uvicorn/Easypanel)
+app = FastAPI(title="Modbus Broker", lifespan=lifespan)
+
+# Define a rota de diagnóstico de saúde da aplicação
+@app.get("/health")
+async def health():
+    # Calcula se a aplicação está dentro da janela de prioridade exclusiva do Notebook
+    in_priority = (time.time() - last_notebook_activity) < NOTEBOOK_PRIORITY_TIMEOUT
+    # Retorna o dicionário serializado automaticamente em JSON com o status do sistema
+    return {
+        "status": "online",
+        "usr_connected": usr_writer is not None,
+        "priority_mode_notebook": in_priority
+    }
+
+# Define o endpoint HTTP utilizado pelo n8n na porta 5000 para leitura de registradores Modbus
+@app.get("/read_holding_registers")
+async def read_holding_registers(
+    unit: int = Query(1, description="ID Modbus do escravo"),
+    address: int = Query(0, description="Endereço inicial dos registadores"),
+    count: int = Query(10, description="Quantidade de registadores a ler")
+):
+    # Verifica se o Notebook realizou comunicação dentro da janela dos últimos 5 segundos
+    if (time.time() - last_notebook_activity) < NOTEBOOK_PRIORITY_TIMEOUT:
+        # Registra no log o bloqueio/rejeição da requisição vinda do n8n
+        logger.info("[BLOQUEIO] Requisição do n8n rejeitada/bloqueada: Coleta do Notebook ativa na 9002.")
+        # Lança exceção HTTP 503 (Serviço Indisponível) liberando o n8n sem interferir na coleta
+        raise HTTPException(status_code=503, detail="FieldLogger ocupado em alta prioridade pelo Notebook")
+
+    # Verifica se a conexão física com o USR-TCP232 está ativa antes de tentar enviar comando
+    if not usr_writer or not usr_reader:
+        # Lança exceção HTTP 503 informando que o equipamento está desconectado
+        raise HTTPException(status_code=503, detail="USR-TCP232 não conectado na porta 9001")
+
+    # Constrói o vetor de bytes (bytearray) contendo o cabeçalho do comando Modbus RTU (Função 0x03)
+    raw_payload = bytearray([
+        unit,                        # Endereço ID do escravo Modbus
+        0x03,                        # Código da Função Modbus: Read Holding Registers
+        (address >> 8) & 0xFF,       # Byte mais significativo (MSB) do endereço inicial
+        address & 0xFF,              # Byte menos significativo (LSB) do endereço inicial
+        (count >> 8) & 0xFF,         # Byte mais significativo (MSB) da quantidade de registradores
+        count & 0xFF                 # Byte menos significativo (LSB) da quantidade de registradores
+    ])
+
+    # Inicializa o valor base de 16 bits para cálculo de checksum CRC16 Modbus
+    crc = 0xFFFF
+    # Percorre cada byte montado no payload para efetuar o cálculo de redundância cíclica
+    for pos in raw_payload:
+        # Realiza operação lógica XOR entre o valor acumulado e o byte atual
+        crc ^= pos
+        # Processa cada um dos 8 bits do byte
+        for _ in range(8):
+            # Verifica se o bit menos significativo é igual a 1
+            if (crc & 0x0001) != 0:
+                # Desloca os bits uma posição para a direita
+                crc >>= 1
+                # Aplica XOR com o polinômio padrão Modbus (0xA001)
+                crc ^= 0xA001
+            # Caso o bit seja 0
+            else:
+                # Apenas desloca os bits uma posição para a direita
+                crc >>= 1
+    # Adiciona o byte LSB do CRC calculated ao final da mensagem Modbus
+    raw_payload.append(crc & 0xFF)
+    # Adiciona o byte MSB do CRC calculated ao final da mensagem Modbus
+    raw_payload.append((crc >> 8) & 0xFF)
+
+    # Adquire a trava mutex garantindo que nenhuma outra requisição escreva ao mesmo tempo no USR
+    async with modbus_lock:
+        # Bloco de tentativa de transmissão e recepção Modbus
+        try:
+            # Envia a trama binária completa via socket TCP para o USR-TCP232
+            usr_writer.write(raw_payload)
+            # Esvazia o buffer e força o envio do pacote binário pela rede
+            await usr_writer.drain()
+
+            # Aguarda o retorno da resposta binária do FieldLogger com timeout de 3 segundos
+            response = await asyncio.wait_for(usr_reader.read(1024), timeout=3.0)
+            # Retorna o objeto JSON contendo o status e os dados em formato hexadecimal para o n8n
+            return {
+                "status": "success",
+                "bytes_hex": response.hex(),
+                "raw_bytes": list(response)
+            }
+        # Captura estouro de tempo no aguardo do retorno do equipamento
+        except asyncio.TimeoutError:
+            # Lança resposta HTTP 504 (Gateway Timeout) para o n8n
+            raise HTTPException(status_code=504, detail="Timeout de resposta do FieldLogger")
+        # Captura exceções genéricas de falha na comunicação
+        except Exception as e:
+            # Lança resposta HTTP 500 informando a mensagem de exceção capturada
+            raise HTTPException(status_code=500, detail=str(e))
