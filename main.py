@@ -19,27 +19,27 @@ usr_writer = None
 last_notebook_activity = 0
 NOTEBOOK_PRIORITY_TIMEOUT = 10.0  # Tempo de tolerância pós-download (em segundos)
 
-def tune_socket(writer):
-    """Aplica flags de socket direto no Kernel do SO para simular a performance do socat."""
+def tune_socket(writer_or_reader):
+    """Aplica flags TCP diretamente no SO para garantir baixa latência e máximo throughput."""
     try:
-        sock = writer.get_extra_info('socket')
+        sock = writer_or_reader.get_extra_info('socket')
         if sock:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     except Exception as e:
-        logger.warning(f"Erro ao ajustar flags de socket: {e}")
+        logger.warning(f"Erro ao aplicar configurações no socket: {e}")
 
 async def handle_usr_client(reader, writer):
     """Gerencia a conexão mantida com o módulo USR-TCP232 na porta 9001."""
     global usr_reader, usr_writer
     addr = writer.get_extra_info('peername')
-    logger.info(f"[USR] Dispositivo conectado: {addr}")
+    logger.info(f"[USR] Dispositivo conectado na porta 9001: {addr}")
     
     tune_socket(writer)
 
-    if usr_writer is not None:
-        logger.warning("[USR] Nova conexão recebida. Encerrando conexão anterior...")
+    if usr_writer is not None and not usr_writer.is_closing():
+        logger.warning("[USR] Nova conexão recebida no USR. Encerrando anterior...")
         try:
             usr_writer.close()
         except Exception:
@@ -49,31 +49,25 @@ async def handle_usr_client(reader, writer):
     usr_writer = writer
 
     try:
-        # Mantém o socket ativo
-        while not writer.is_closing():
-            await asyncio.sleep(3600)
+        # Mantém a conexão ativa no loop sem bloquear o ponteiro de leitura do StreamReader
+        await writer.wait_closed()
     except (ConnectionResetError, BrokenPipeError, OSError, asyncio.CancelledError):
         pass
     finally:
-        logger.info(f"[USR] Dispositivo desconectado: {addr}")
+        logger.info(f"[USR] Dispositivo desconectado da porta 9001: {addr}")
         if usr_writer == writer:
             usr_reader = None
             usr_writer = None
-        try:
-            writer.close()
-        except Exception:
-            pass
 
 async def direct_kernel_pipe(reader_src, writer_dst, label, is_notebook=False):
     """
-    Ponte de altíssima velocidade (Direct Pipe).
-    Lê blocos brutos em nível de socket sem interferência do event-loop do Python.
+    Ponte de transmissão de dados brutos (Direct Pipe nível de socket).
+    Simula o comportamento do socat repassando pacotes bidirecionalmente sem parsing.
     """
     global last_notebook_activity
     try:
         while True:
-            # Chunk grande para suportar rajadas massivas da memória flash
-            data = await reader_src.read(16384)
+            data = await reader_src.read(16384)  # Chunks de 16KB para aguentar rajadas pesadas
             if not data:
                 break
             
@@ -89,8 +83,8 @@ async def direct_kernel_pipe(reader_src, writer_dst, label, is_notebook=False):
 
 async def handle_notebook_client(reader_nb, writer_nb):
     """
-    Quando o FieldLogger Config conecta na porta 9002, o Python assume o modo 'socat':
-    Bloqueia chamadas HTTP e faz o repasse transparente de dados na máxima velocidade.
+    Atende conexões na porta 9002 (Eltima / FieldLogger Config).
+    Conecta o socket 9002 ao socket 9001 em modo transparente e bloqueia o n8n temporariamente.
     """
     global last_notebook_activity, usr_reader, usr_writer
     addr = writer_nb.get_extra_info('peername')
@@ -104,7 +98,7 @@ async def handle_notebook_client(reader_nb, writer_nb):
         await writer_nb.wait_closed()
         return
 
-    # Bloqueia qualquer chamada REST enquanto o Notebook/FieldLogger Config estiver operando
+    # Adquire o lock para evitar que requisições REST do n8n misturem bytes na transmissão Modbus RTU
     async with modbus_lock:
         logger.info("[MODO TUNNEL] Mapeando tráfego direto FieldLogger Config <-> USR-TCP232")
         
@@ -115,16 +109,15 @@ async def handle_notebook_client(reader_nb, writer_nb):
             direct_kernel_pipe(usr_reader, writer_nb, "USR -> NOTEBOOK")
         )
 
-        # Aguarda qualquer uma das pontas encerrar o download ou fechar a porta
-        done, pending = await asyncio.wait(
-            [task_nb_to_usr, task_usr_to_nb],
-            return_when=asyncio.FIRST_COMPLETED
-        )
-
-        for task in pending:
-            task.cancel()
-
-        last_notebook_activity = time.time()
+        try:
+            # Aguarda o encerramento da comunicação por qualquer um dos lados
+            await asyncio.gather(task_nb_to_usr, task_usr_to_nb, return_exceptions=True)
+        except Exception as e:
+            logger.error(f"[TUNNEL] Exceção durante a ponte: {e}")
+        finally:
+            task_nb_to_usr.cancel()
+            task_usr_to_nb.cancel()
+            last_notebook_activity = time.time()
 
     logger.info(f"[NOTEBOOK] Operação concluída. Fechando ponte 9002. Reassumindo modo REST/n8n.")
     try:
@@ -164,7 +157,7 @@ async def read_holding_registers(
 ):
     global usr_reader, usr_writer
     
-    # Se o FieldLogger Config estiver baixando dados ou finalizou a menos de 10 segundos
+    # Se o FieldLogger Config estiver a realizar download de dados ou terminou há menos de 10 segundos
     if (time.time() - last_notebook_activity) < NOTEBOOK_PRIORITY_TIMEOUT:
         raise HTTPException(
             status_code=503, 
@@ -199,7 +192,6 @@ async def read_holding_registers(
 
     async with modbus_lock:
         try:
-            # Limpa qualquer resíduo do buffer antes de enviar
             usr_writer.write(raw_payload)
             await usr_writer.drain()
 
