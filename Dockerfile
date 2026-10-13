@@ -11,4 +11,4 @@ EXPOSE 5000
 EXPOSE 9001
 EXPOSE 9002
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "5000"]
+CMD ["python", "main.py"]
