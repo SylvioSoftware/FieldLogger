@@ -220,7 +220,7 @@ async def write_register(
             await usr_writer.drain()
 
             # O FieldLogger ecoa a mensagem em caso de sucesso na escrita (8 bytes)
-            response = await asyncio.wait_for(usr_reader.read(1024), timeout=2.5)
+            response = await asyncio.wait_for(usr_reader.read(1024), timeout=5)
             return {
                 "status": "success",
                 "bytes_hex": response.hex(),
