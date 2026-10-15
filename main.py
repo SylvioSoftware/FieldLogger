@@ -178,3 +178,57 @@ async def read_holding_registers(
             usr_reader = None
             usr_writer = None
             raise HTTPException(status_code=500, detail=f"Conexão com USR perdida: {e}")
+
+
+@app.get("/write_register")
+async def write_register(
+    unit: int = Query(1),
+    address: int = Query(990),
+    value: int = Query(1)
+):
+    global usr_reader, usr_writer
+    
+    if not usr_writer or not usr_reader:
+        raise HTTPException(status_code=503, detail="USR-TCP232 não conectado na porta 9001")
+
+    if modbus_lock.locked():
+        raise HTTPException(status_code=503, detail="Barramento ocupado pela porta 9002")
+
+    # Montagem do pacote Modbus RTU para escrita de registrador único (Função 06H)
+    raw_payload = bytearray([
+        unit, 0x06,
+        (address >> 8) & 0xFF, address & 0xFF,
+        (value >> 8) & 0xFF, value & 0xFF
+    ])
+
+    # Cálculo do CRC16
+    crc = 0xFFFF
+    for pos in raw_payload:
+        crc ^= pos
+        for _ in range(8):
+            if (crc & 0x0001) != 0:
+                crc >>= 1
+                crc ^= 0xA001
+            else:
+                crc >>= 1
+    raw_payload.append(crc & 0xFF)
+    raw_payload.append((crc >> 8) & 0xFF)
+
+    async with modbus_lock:
+        try:
+            usr_writer.write(raw_payload)
+            await usr_writer.drain()
+
+            # O FieldLogger ecoa a mensagem em caso de sucesso na escrita (8 bytes)
+            response = await asyncio.wait_for(usr_reader.read(1024), timeout=2.5)
+            return {
+                "status": "success",
+                "bytes_hex": response.hex(),
+                "raw_bytes": list(response)
+            }
+        except asyncio.TimeoutError:
+            raise HTTPException(status_code=504, detail="Timeout de resposta do FieldLogger")
+        except (ConnectionResetError, BrokenPipeError, OSError) as e:
+            usr_reader = None
+            usr_writer = None
+            raise HTTPException(status_code=500, detail=f"Conexão com USR perdida: {e}")
