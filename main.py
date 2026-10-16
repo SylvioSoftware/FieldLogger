@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import socket
+import struct    #Adicionado para qunado TPLINK reiniciar a conexao da porta 9001 seja refeita
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query
 
@@ -24,6 +25,14 @@ def tune_socket(writer):
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+            #Adicionado para qunado TPLINK reiniciar a conexao da porta 9001 seja refeita
+            # Força o SO a liberar portas travadas em TIME_WAIT mais rápido se suportado
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
+            except Exception:
+                pass
+            #Fim da adição
             
             # Configurações de Keepalive no SO para matar sockets zumbis rapidamente
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 5)  # 5s ocioso
